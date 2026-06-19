@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Coste de carga EV V7</title>
+<title>Coste de carga EV V8</title>
 <style>
 :root{
   --bg:#0b0f14;
@@ -117,6 +117,7 @@ button.danger{background:#3a2024;color:#ffd9de}
 .hidden{display:none}
 hr{border:0;border-top:1px solid var(--border);margin:14px 0}
 .vehicleLine{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:13px;margin-top:6px}
+.statusLine{margin-top:8px;color:var(--muted);font-size:12px;line-height:1.4}
 .priceBadge{
   display:inline-block;
   border:1px solid var(--border);
@@ -204,6 +205,8 @@ hr{border:0;border-top:1px solid var(--border);margin:14px 0}
           <div class="priceBadge" id="currentHourlyPrice">Sin tabla</div>
         </div>
       </div>
+      <button id="loadSelectra">Cargar precios de hoy desde Selectra</button>
+      <div class="statusLine" id="selectraStatus">También puedes pegar la tabla manualmente si la carga automática falla.</div>
       <label>Pega aquí tabla horaria Selectra/Telegram</label>
       <textarea id="hourlyText" placeholder="🟢 14:00 - 15:00 : 0.03489€/kWh"></textarea>
       <button class="secondary" id="parseHourly">Usar tabla pegada</button>
@@ -295,15 +298,95 @@ function updateEffective(){
   if($('vehicleSummary')) $('vehicleSummary').textContent = name + ' · ' + fmt(eff) + ' kWh efectivos';
 }
 function currentHour(){ return new Date().getHours(); }
+function todayISO(){
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
+function normalizedSelectraText(htmlText){
+  try{
+    const doc = new DOMParser().parseFromString(htmlText, 'text/html');
+    return doc.body.textContent.replace(/\s+/g,' ');
+  }catch(e){
+    return htmlText.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ');
+  }
+}
+function parseSelectraPage(htmlText){
+  const text = normalizedSelectraText(htmlText);
+  const arr = [];
+  const re = /(\d{2}:00)\s*-\s*(\d{2}:00|24:00)\s*([0-9]+(?:[,.][0-9]+)?)\s*€\/?kWh/g;
+  let m;
+  while((m = re.exec(text)) !== null){
+    const start = parseInt(m[1].slice(0,2),10);
+    const end = m[2] === '24:00' ? 0 : parseInt(m[2].slice(0,2),10);
+    const price = parseFloat(m[3].replace(',','.'));
+    if(Number.isFinite(start) && Number.isFinite(price)){
+      arr.push({start,end,price});
+    }
+  }
+  const unique = [];
+  const seen = new Set();
+  for(const x of arr){
+    if(!seen.has(x.start)){
+      seen.add(x.start);
+      unique.push(x);
+    }
+  }
+  return unique.slice(0,24).sort((a,b)=>a.start-b.start);
+}
+function hourlyArrayToTelegramText(arr){
+  return arr.map(x=>{
+    const s = String(x.start).padStart(2,'0') + ':00';
+    const e = x.end === 0 ? '00:00' : String(x.end).padStart(2,'0') + ':00';
+    const icon = x.price < 0.11 ? '🟢' : x.price < 0.18 ? '🟡' : '🔴';
+    return `${icon} ${s} - ${e} : ${x.price.toFixed(5)}€/kWh`;
+  }).join('\n');
+}
+async function loadSelectraPrices(){
+  const status = $('selectraStatus');
+  const date = todayISO();
+  const target = `https://selectra.es/energia/semaforo-selectra?date=${date}`;
+  status.textContent = 'Cargando precios de Selectra para ' + date + '...';
+  const urls = [
+    target,
+    'https://api.allorigins.win/raw?url=' + encodeURIComponent(target)
+  ];
+  let lastError = '';
+  for(const url of urls){
+    try{
+      const res = await fetch(url, {cache:'no-store'});
+      if(!res.ok) throw new Error('HTTP ' + res.status);
+      const txt = await res.text();
+      const arr = parseSelectraPage(txt);
+      if(arr.length >= 24){
+        hourlyPrices = arr;
+        const asText = hourlyArrayToTelegramText(arr);
+        $('hourlyText').value = asText;
+        localStorage.setItem('ev_hourly_text', asText);
+        localStorage.setItem('ev_hourly_date', date);
+        $('currentHourlyPrice').textContent = fmtKwhPrice(getHourlyPriceAt(currentHour()));
+        status.textContent = 'Precios cargados correctamente para hoy (' + date + ').';
+        return;
+      }
+      lastError = 'No se han detectado 24 franjas.';
+    }catch(e){
+      lastError = e.message || String(e);
+    }
+  }
+  status.textContent = 'No se pudo cargar automáticamente. Pega la tabla de Telegram/Selectra y pulsa “Usar tabla pegada”. Error: ' + lastError;
+}
 
 function parseHourlyText(){
   const text = $('hourlyText').value;
   const lines = text.split(/\n+/);
   const arr = [];
   for(const line of lines){
-    const m = line.match(/(\d{1,2}):00\s*-\s*(\d{1,2}):00\s*:\s*([0-9]+(?:[.,][0-9]+)?)/);
+    const m = line.match(/(\d{1,2}):00\s*-\s*(\d{1,2}|24):00\s*:\s*([0-9]+(?:[.,][0-9]+)?)/);
     if(m){
-      arr.push({start:parseInt(m[1],10), end:parseInt(m[2],10), price:parseFloat(m[3].replace(',','.'))});
+      const endHour = parseInt(m[2],10);
+      arr.push({start:parseInt(m[1],10), end:endHour===24?0:endHour, price:parseFloat(m[3].replace(',','.'))});
     }
   }
   hourlyPrices = arr;
@@ -531,6 +614,7 @@ $('btnTarget').addEventListener('click',()=>setCalcType('target'));
 $('btnBudget').addEventListener('click',()=>setCalcType('budget'));
 $('btnKm').addEventListener('click',()=>setCalcType('km'));
 $('parseHourly').addEventListener('click',parseHourlyText);
+$('loadSelectra').addEventListener('click',loadSelectraPrices);
 $('calc').addEventListener('click',()=>{ save(); renderResult(); });
 $('save').addEventListener('click',()=>{ save(); renderResult(); alert('Configuración guardada'); });
 $('reset').addEventListener('click',reset);
